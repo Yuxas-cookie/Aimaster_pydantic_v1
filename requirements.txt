@@ -1,0 +1,11 @@
+# Start of Selection
+pytorch_lightning==1.9.4
+pydantic==1.10.12
+open-clip-torch==2.20.0
+basicsr
+httpx==0.24.1
+opencv-python
+spandrel
+ultralytics==8.3.29
+psd_tools
+# End of Selection
