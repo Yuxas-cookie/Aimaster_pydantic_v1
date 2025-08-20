@@ -1,27 +1,29 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eEuo pipefail
 
-# ====== config ======
+# ===== visible, robust logging =====
+log(){ echo -e "\n\033[1;32m[INFO]\033[0m $*"; }
+err(){ echo -e "\n\033[1;31m[ERROR]\033[0m $*" >&2; }
+trap 'code=$?; err "Failed at line $LINENO (exit $code)"; exit $code' ERR
+
+# ===== config =====
 VENV_DIR="/content/py310"
 WEBUI_DIR="/content/stable-diffusion-webui"
 RUN_ARGS="--share --gradio-debug --enable-insecure-extension-access --disable-safe-unpickle"
 REQ_AIMASTER="/content/Aimaster_pydantic_v1/requirements.txt"
 CONSTRAINTS="/tmp/constraints_a1111.txt"
-# ====================
-
-log(){ echo -e "\n\033[1;32m[INFO]\033[0m $*"; }
-err(){ echo -e "\n\033[1;31m[ERROR]\033[0m $*" >&2; }
+PYTHON_BIN="python3.10"
 SUDO=""
-if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
+command -v sudo >/dev/null 2>&1 && SUDO="sudo"
 
-need_pkg(){
-  dpkg -s "$1" >/dev/null 2>&1 || return 0
-  return 1
-}
+log "Start setup_py310_colab.sh"
+uname -a || true
+$PYTHON_BIN -V || true
 
-have_py310(){ command -v python3.10 >/dev/null 2>&1; }
+# ----- helpers -----
+have_py310(){ command -v $PYTHON_BIN >/dev/null 2>&1; }
 have_ensurepip(){
-  python3.10 - <<'PY' >/dev/null 2>&1 || exit 1
+  $PYTHON_BIN - <<'PY' >/dev/null 2>&1 || exit 1
 import importlib.util
 ok = importlib.util.find_spec("venv") and importlib.util.find_spec("ensurepip")
 raise SystemExit(0 if ok else 1)
@@ -29,53 +31,60 @@ PY
 }
 
 install_py310_stack(){
-  log "Installing Python 3.10 toolchain via APT"
+  log "Installing Python 3.10 stack via APT"
   $SUDO apt-get update -y
   $SUDO apt-get install -y python3.10 python3.10-dev python3.10-distutils || true
   $SUDO apt-get install -y python3.10-venv python3-pip
 }
 
-# --- 1) Python3.10 & ensurepip 確保 ---
+# ----- 1) Python 3.10 と ensurepip の確保 -----
 if ! have_py310; then
+  log "python3.10 not found -> installing"
   install_py310_stack
 else
+  log "python3.10 found"
   if ! have_ensurepip; then
-    log "python3.10-venv が必要です。APTで導入します。"
+    log "ensurepip/venv is missing -> installing python3.10-venv"
     $SUDO apt-get update -y
     $SUDO apt-get install -y python3.10-venv
   fi
 fi
 
-# 念のため ensurepip を最新化
-python3.10 -m ensurepip --upgrade || true
+# 念のため
+$PYTHON_BIN -m ensurepip --upgrade || true
 
-# --- 2) venv 作成（ensurepip が無ければ再度Apt→再試行） ---
+# ----- 2) venv 作成 -----
 if [ ! -d "$VENV_DIR" ]; then
   log "Creating venv at $VENV_DIR"
-  if ! python3.10 -m venv "$VENV_DIR"; then
-    log "Retrying after ensuring python3.10-venv"
+  if ! $PYTHON_BIN -m venv "$VENV_DIR"; then
+    log "Retry venv after (re)installing python3.10-venv"
     $SUDO apt-get install -y python3.10-venv
-    python3.10 -m venv "$VENV_DIR"
+    $PYTHON_BIN -m venv "$VENV_DIR"
   fi
+else
+  log "venv already exists at $VENV_DIR"
 fi
 
-# --- 3) venv 有効化 & 基本ツール ---
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
-log "Upgrading pip/setuptools/wheel"
+export PYTHONUNBUFFERED=1
+log "Python in venv: $(python -V)"
+
+# pip/toolchain
+log "Upgrading pip / setuptools / wheel in venv"
 python -m pip install --upgrade pip setuptools wheel
 
-# --- 4) Colab の matplotlib_inline 問題 & PL 旧 import 互換を sitecustomize で吸収 ---
+# ----- 3) Colab特有の backend 問題 & PL 旧import を sitecustomize で吸収 -----
 SITE_DIR="$(python - <<'PY'
 import site; p=site.getsitepackages(); print(p[0] if p else '')
 PY
 )"
-if [ -z "$SITE_DIR" ]; then err "site-packages が見つかりません"; exit 1; fi
+[ -z "$SITE_DIR" ] && { err "site-packages not found"; exit 1; }
 
-log "Writing sitecustomize.py (MPL backend & PL shim)"
+log "Writing sitecustomize.py to: $SITE_DIR"
 cat > "${SITE_DIR}/sitecustomize.py" <<'PY'
 import os, sys, types
-# 1) Colab の inline backend を Agg に固定
+# 1) Force non-interactive backend for matplotlib in Colab
 if os.environ.get("MPLBACKEND","").startswith("module://matplotlib_inline"):
     os.environ["MPLBACKEND"] = "Agg"
 try:
@@ -85,7 +94,7 @@ try:
 except Exception:
     pass
 
-# 2) A1111 が参照する古い pytorch_lightning import を提供
+# 2) Provide legacy import path for AUTOMATIC1111 (PL <-> rank_zero shim)
 try:
     import importlib
     try:
@@ -99,8 +108,11 @@ except Exception:
     pass
 PY
 
-# --- 5) A1111 と相性の良い依存を先に固定（Torch 2.1.2/cu121 等） ---
-log "Pre-pinning numeric & core stack"
+mkdir -p ~/.config/matplotlib
+echo "backend: Agg" > ~/.config/matplotlib/matplotlibrc
+
+# ----- 4) A1111 に合わせて先に土台を固定（Torch 2.1.2/cu121 等）-----
+log "Pre-pinning numeric/core stack"
 python -m pip install \
   "numpy==1.26.4" \
   "scipy==1.11.4" \
@@ -108,12 +120,11 @@ python -m pip install \
   "scikit-image==0.21.0" \
   "pillow==10.4.0"
 
-log "Installing torch==2.1.2 / torchvision==0.16.2 (cu121 wheels)"
+log "Installing torch==2.1.2 / torchvision==0.16.2 (cu121)"
 python -m pip install torch==2.1.2 torchvision==0.16.2 \
   --extra-index-url https://download.pytorch.org/whl/cu121
 
-# A1111 の requirements（ユーザー提示）に合わせた固定
-log "Pinning webui-aligned packages"
+log "Pinning webui-aligned libs"
 python -m pip install \
   "transformers==4.30.2" \
   "pytorch_lightning==1.9.5" \
@@ -124,15 +135,14 @@ python -m pip install \
   "tokenizers==0.13.3" \
   "starlette==0.25.0"
 
-# xformers 警告/不一致回避（使わない前提）
+# xformers は無効化（不一致警告を避ける）
 python -m pip uninstall -y xformers || true
 export XFORMERS_DISABLED=1
 
-# --- 6) Aimaster の要件を「制約付きで」導入（Torch等を上書きしない） ---
+# ----- 5) Aimaster の requirements を制約付きで導入（上書きを防止）-----
 if [ -f "$REQ_AIMASTER" ]; then
   log "Writing constraints file: $CONSTRAINTS"
   cat > "$CONSTRAINTS" <<'TXT'
-# Prevent upgrades that break AUTOMATIC1111 stack
 torch==2.1.2
 torchvision==0.16.2
 numpy==1.26.4
@@ -148,34 +158,28 @@ tokenizers==0.13.3
 starlette==0.25.0
 TXT
 
-  log "Installing Aimaster requirements with constraints"
-  # 依存解決で torch などが上書きされないよう -c を併用
+  log "Installing /content/Aimaster_pydantic_v1/requirements.txt with constraints"
   PIP_PREFER_BINARY=1 python -m pip install -r "$REQ_AIMASTER" -c "$CONSTRAINTS"
 else
   log "Skip Aimaster requirements (not found): $REQ_AIMASTER"
 fi
 
-# 念のため Matplotlib の rc も固定
-mkdir -p ~/.config/matplotlib
-echo "backend: Agg" > ~/.config/matplotlib/matplotlibrc
-
-# --- 7) WebUI 実行ヘルパ（venv の python で起動） ---
+# ----- 6) WebUI 起動関数（venvのpythonで実行）-----
 RUN_WEBUI(){
-  if [ ! -d "$WEBUI_DIR" ]; then
-    err "Not found: ${WEBUI_DIR}  (先に git clone 済みか確認してください)"
-    exit 1
-  fi
-  log "Launching AUTOMATIC1111 webui (venv python)"
+  [ -d "$WEBUI_DIR" ] || { err "Not found: ${WEBUI_DIR} (git clone 済みか確認)"; exit 1; }
+  log "Launching AUTOMATIC1111 webui with venv python"
   cd "$WEBUI_DIR"
   export PYTHONNOUSERSITE=1
   export MPLBACKEND=Agg
   export XFORMERS_DISABLED=1
+  # exec で置き換え → 以降のログは Python 側から出ます
   exec "$VENV_DIR/bin/python" launch.py ${RUN_ARGS}
 }
 
+# ----- 7) 引数で制御 -----
 if [[ "${1:-}" == "--run-webui" ]]; then
   RUN_WEBUI
 else
-  log "Setup completed."
-  echo "To run webui:  !bash /content/Aimaster_pydantic_v1/setup_py310_venv.sh --run-webui"
+  log "Setup completed. To run webui:"
+  echo "!stdbuf -oL -eL bash -x /content/Aimaster_pydantic_v1/setup_py310_colab.sh --run-webui 2>&1 | tee /content/py310_setup.log"
 fi
