@@ -14,7 +14,7 @@ import sys
 import tempfile
 from datetime import datetime
 from typing import Any, Literal, Sequence
-from urllib.parse import quote, unquote, urlencode
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 if sys.version_info >= (3, 11):
     from typing import Self
@@ -1166,14 +1166,10 @@ class Settings(BaseModel):
 
     @staticmethod
     def validate_url(url: str) -> None:
-        """Validate a URL string."""
-        url_validator = SchemaValidator(
-            core_schema.url_schema(
-                allowed_schemes=["http", "https"],
-                strict=True,
-            )
-        )
-        url_validator.validate_python(url)
+        """Validate a URL string without pydantic_core (works with pydantic v1)."""
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            raise ValueError(f"Invalid URL: {url!r}")
 
     def _get_program(self) -> str | None:
         """Get the program that started the current process."""
@@ -1263,3 +1259,4 @@ class Settings(BaseModel):
             return val
         elif isinstance(val, str):
             return RunMoment.from_uri(val)
+        return None
