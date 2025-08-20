@@ -4,21 +4,19 @@ set -euo pipefail
 log() { echo -e "\n\033[1;32m[INFO]\033[0m $*"; }
 err() { echo -e "\n\033[1;31m[ERROR]\033[0m $*" >&2; }
 
-SUDO=""; command -v sudo >/dev/null 2>&1 && SUDO="sudo"
-
 REPO_ROOT="/content/Aimaster_pydantic_v1"
 REQ_FILE="$REPO_ROOT/requirements.txt"
 VENV_DIR="/content/py310"
 VENV_PY="$VENV_DIR/bin/python"
 VENV_PIP="$VENV_DIR/bin/pip"
 
-# 1) Python 3.10 を入れる
+# 1) Python 3.10 を用意
 log "Installing Python 3.10 toolchain"
-$SUDO apt-get update -y
-$SUDO apt-get install -y software-properties-common
-$SUDO add-apt-repository -y ppa:deadsnakes/ppa || true
-$SUDO apt-get update -y
-$SUDO apt-get install -y python3.10 python3.10-venv python3.10-dev python3.10-distutils
+apt-get update -y
+apt-get install -y software-properties-common
+add-apt-repository -y ppa:deadsnakes/ppa || true
+apt-get update -y
+apt-get install -y python3.10 python3.10-venv python3.10-dev python3-distutils
 
 # 2) venv 作成
 if [ ! -d "$VENV_DIR" ]; then
@@ -26,21 +24,20 @@ if [ ! -d "$VENV_DIR" ]; then
   python3.10 -m venv "$VENV_DIR"
 fi
 
-# 3) venv 内に pip を必ず用意（ensurepip → get-pip.py フォールバック）
-log "Ensuring pip exists inside venv"
+# 3) venv に pip を必ず入れる（ensurepip → get-pip.py フォールバック）
+log "Ensuring pip exists in venv"
 if ! "$VENV_PY" -c "import pip" >/dev/null 2>&1; then
   "$VENV_PY" -m ensurepip --upgrade || true
 fi
 if ! "$VENV_PY" -c "import pip" >/dev/null 2>&1; then
-  log "ensurepip failed; bootstrapping pip via get-pip.py"
   curl -sSfL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
   "$VENV_PY" /tmp/get-pip.py
 fi
 
-# 4) venv の pip をアップデート
+# 4) pip/セットアップ系を更新
 "$VENV_PY" -m pip install -U pip setuptools wheel
 
-# 5) 数値系は先に固定して衝突回避（NumPy/Scipy/Matplotlib 由来の落ちを防ぐ）
+# 5) 先に数値系を入れて足並みを揃える（SciPy/Numpy 周りの崩れ防止）
 log "Pre-pinning numeric stack"
 "$VENV_PIP" install \
   "numpy==1.26.4" \
@@ -49,35 +46,31 @@ log "Pre-pinning numeric stack"
   "scikit-image==0.21.0" \
   "pillow==10.4.0"
 
-# ※ Torch は先に入れません（WebUI が自分で 2.1.2+cu121 を入れに行くため）
-#   → ここで入れるとバージョン競合の原因になることがある
-
-# 6) あなたのリポの依存を venv にインストール
+# 6) あなたの requirements を venv にインストール
 if [ ! -f "$REQ_FILE" ]; then
-  err "requirements.txt not found at ${REQ_FILE}"
+  err "requirements.txt not found at $REQ_FILE"
   exit 1
 fi
 log "Installing $REQ_FILE into venv"
 "$VENV_PIP" install -r "$REQ_FILE"
 
-# 7) Matplotlib の backend を Agg に固定（ノートブック側を触らない）
+# 7) Matplotlib を非対話 backend に固定（ノートブック側は触らない）
 SITEPKG="$("$VENV_PY" - <<'PY'
 import site
-cands=[]
+c=[]
 for g in (getattr(site,'getsitepackages',lambda:[]),
           getattr(site,'getusersitepackages',lambda:'')):
     try:
-        v=g(); cands.extend(v if isinstance(v,list) else [v])
+        v=g(); c.extend(v if isinstance(v,list) else [v])
     except Exception: pass
-cands=[p for p in cands if p and 'site-packages' in p]
-print(cands[0] if cands else '')
+c=[p for p in c if p and 'site-packages' in p]
+print(c[0] if c else '')
 PY
 )"
 if [ -n "$SITEPKG" ]; then
   log "Writing sitecustomize.py to $SITEPKG"
   cat > "${SITEPKG}/sitecustomize.py" <<'PY'
 import os
-# Colab が入れる inline backend を無効化して Agg を強制
 if os.environ.get("MPLBACKEND","").startswith("module://matplotlib_inline"):
     os.environ["MPLBACKEND"] = "Agg"
 try:
@@ -90,16 +83,37 @@ PY
   chmod a+r "${SITEPKG}/sitecustomize.py"
 fi
 
-# 8) /usr/local/bin/python を venv 側に差し替え（拡張が絶対パス実行してもOK）
-log "Pointing /usr/local/bin/python & pip to venv"
-$SUDO ln -sf "$VENV_PY"  /usr/local/bin/python
-$SUDO ln -sf "$VENV_PIP" /usr/local/bin/pip || true
-hash -r || true
+# 8) /usr/local/bin/python/pip を「ラッパー」に置き換えて venv を強制
+log "Installing wrapper /usr/local/bin/python -> $VENV_PY"
+cat >/usr/local/bin/python <<SH
+#!/usr/bin/env bash
+unset PYTHONHOME
+unset PYTHONPATH
+exec "$VENV_PY" "\$@"
+SH
+chmod +x /usr/local/bin/python
 
-# 9) 動作確認
+log "Installing wrapper /usr/local/bin/pip -> $VENV_PIP"
+cat >/usr/local/bin/pip <<SH
+#!/usr/bin/env bash
+unset PYTHONHOME
+unset PYTHONPATH
+exec "$VENV_PIP" "\$@"
+SH
+chmod +x /usr/local/bin/pip
+
+# 9) 念のため /usr/local/bin/python に対しても pip を保証
+/usr/local/bin/python -m ensurepip --upgrade || true
+if ! /usr/local/bin/python -c "import pip" >/dev/null 2>&1; then
+  curl -sSfL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+  /usr/local/bin/python /tmp/get-pip.py
+fi
+/usr/local/bin/python -m pip install -U pip setuptools wheel
+
+# 10) 動作確認
+log "Check: which python -> $(command -v python)"
+log "Check: python -V    -> $(python -V 2>&1)"
 log "Check: python -m pip --version"
 python -m pip --version
-log "Check: which python -> $(command -v python)"
-python -V
 
-log "Setup completed. Launch WebUI as usual."
+log "Setup completed. Launch WebUI as usual (python launch.py)."
