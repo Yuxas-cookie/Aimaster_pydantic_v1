@@ -49,3 +49,45 @@ log "Done. Current python is: $(python -V 2>&1)"
 log "Forcing matplotlib non-interactive backend"
 mkdir -p ~/.config/matplotlib
 echo "backend: Agg" > ~/.config/matplotlib/matplotlibrc
+
+# --- Force non-interactive Matplotlib backend globally (works without changing Colab cells) ---
+PY310_SITE=$(python3.10 - <<'PY'
+import site, sys
+# site.getsitepackages() が無い環境でも安全に拾う
+candidates = []
+for getter in (getattr(site, "getsitepackages", lambda: []),
+               getattr(site, "getusersitepackages", lambda: "")):
+    try:
+        v = getter()
+        if isinstance(v, str): candidates.append(v)
+        else: candidates.extend(v)
+    except Exception:
+        pass
+paths = [p for p in candidates if p and "site-packages" in p]
+print(paths[0] if paths else "")
+PY
+)
+
+if [ -n "$PY310_SITE" ]; then
+  echo "Installing sitecustomize.py into: $PY310_SITE"
+  cat > "${PY310_SITE}/sitecustomize.py" <<'PY'
+import os
+# Colab が設定してくる inline backend を潰して Agg を強制
+inline = "module://matplotlib_inline"
+val = os.environ.get("MPLBACKEND", "")
+if val.startswith(inline):
+    os.environ["MPLBACKEND"] = "Agg"
+try:
+    import matplotlib
+    # 既に inline が選ばれていたら強制的に Agg に切替
+    if str(matplotlib.get_backend()).startswith("module://"):
+        matplotlib.use("Agg", force=True)
+except Exception:
+    pass
+PY
+  # 念のため読み取り権限を確保
+  chmod a+r "${PY310_SITE}/sitecustomize.py"
+else
+  echo "WARNING: could not locate Python3.10 site-packages; Matplotlib backend fix not installed."
+fi
+# --- end Matplotlib backend fix ---
