@@ -10,5 +10,9 @@ ultralytics==8.3.29
 psd_tools
 watchdog>=5.0.0
 wandb==0.17.9
+transformers==4.37.2
+tokenizers==0.15.2
+pillow-avif-plugin==1.4.3
 # End of Selection
+
 
