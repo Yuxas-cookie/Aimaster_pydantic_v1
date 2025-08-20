@@ -1,148 +1,127 @@
 #!/usr/bin/env bash
-# setup_py310_venv.sh
-# Colab 上に Python3.10 の専用 venv を作り、/usr/local/bin/python をその venv に固定。
-# さらに Matplotlib の backend を Agg に強制し、A1111 WebUI がエラー無く起動できるよう
-# 依存の下地（数値スタック＆Torch 2.1.2/cu121）を整えます。
-
 set -euo pipefail
 
-log(){ echo -e "\n\033[1;32m[INFO]\033[0m $*"; }
-warn(){ echo -e "\n\033[1;33m[WARN]\033[0m $*"; }
-err(){ echo -e "\n\033[1;31m[ERROR]\033[0m $*" >&2; }
+# ========= config =========
+VENV_DIR="/content/py310"
+WEBUI_DIR="/content/stable-diffusion-webui"
+RUN_ARGS="--share --gradio-debug --enable-insecure-extension-access --disable-safe-unpickle"
+# =========================
 
-SUDO=""
-if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
+log() { echo -e "\n\033[1;32m[INFO]\033[0m $*"; }
+err() { echo -e "\n\033[1;31m[ERROR]\033[0m $*" >&2; }
 
-# ===== 設定 =====
-VENV_DIR="${VENV_DIR:-/content/py310}"            # venv の設置先
-PY_BIN_SYS="${PY_BIN_SYS:-python3.10}"            # システムの 3.10 実体
-PY_BIN_VENV="$VENV_DIR/bin/python"
-PIP_BIN_VENV="$VENV_DIR/bin/pip"
-MPLCFG_DIR="/content/.mplconfig"
-TORCH_VER="2.1.2"
-TV_VER="0.16.2"
-TORCH_IDX="https://download.pytorch.org/whl/cu121"
-# =================
-
-log "Installing Python 3.10 toolchain (venv, distutils, pip-whl)"
-$SUDO apt-get update -y
-$SUDO apt-get install -y software-properties-common >/dev/null 2>&1 || true
-# （Colab は jammy なので python3.10 は標準提供。念のため）
-$SUDO apt-get install -y python3.10 python3.10-venv python3.10-dev python3-distutils python3-pip-whl python3-setuptools-whl
-
-# ----- venv 作成 & pip 更新 -----
-if [ ! -d "$VENV_DIR" ]; then
-  log "Creating venv at $VENV_DIR"
-  $PY_BIN_SYS -m venv "$VENV_DIR"
-else
-  log "Reusing existing venv at $VENV_DIR"
+# Python 3.10 が無ければ最小限のパッケージを入れる
+if ! command -v python3.10 >/dev/null 2>&1; then
+  log "Installing Python 3.10 toolchain (apt)"
+  sudo apt-get update -y
+  sudo apt-get install -y python3.10 python3.10-dev python3.10-venv python3-pip
 fi
 
-log "Upgrading pip/setuptools/wheel in venv"
-"$PY_BIN_VENV" -m pip install --upgrade pip setuptools wheel
+# venv 作成
+if [ ! -d "$VENV_DIR" ]; then
+  log "Creating venv at $VENV_DIR"
+  python3.10 -m venv "$VENV_DIR"
+fi
 
-# ----- Matplotlib を headless(Agg) に固定 -----
-log "Force Matplotlib non-interactive backend (Agg)"
-mkdir -p "$MPLCFG_DIR"
-echo "backend: Agg" > "$MPLCFG_DIR/matplotlibrc"
+# venv 有効化
+source "$VENV_DIR/bin/activate"
 
-# sitecustomize でも保険をかける
-SITEPKG=$("$PY_BIN_VENV" - <<'PY'
-import site,sys,os
-cands=[]
-for f in (getattr(site,"getsitepackages",lambda:[]), lambda:[site.getusersitepackages()]):
-    try:
-        v=f()
-        if isinstance(v,str): cands.append(v)
-        else: cands.extend(v)
-    except: pass
-cands=[p for p in cands if "site-packages" in p]
-print(cands[0] if cands else "")
+# pip / build 基本ツール
+log "Upgrading pip/setuptools/wheel"
+python -m pip install --upgrade pip setuptools wheel
+
+# --- Colab の matplotlib_inline バックエンド問題を sitecustomize で恒久対処 ---
+SITE_DIR="$(python - <<'PY'
+import site; p=site.getsitepackages(); print(p[0] if p else '')
 PY
-)
-if [ -n "$SITEPKG" ]; then
-  cat > "$SITEPKG/sitecustomize.py" <<'PY'
-import os
-# Colab が注入する inline backend を潰して Agg に固定
-if os.environ.get("MPLBACKEND","").startswith("module://matplotlib_inline"):
-    os.environ["MPLBACKEND"]="Agg"
-# MPL の設定ディレクトリも固定（書込み不可エラー回避）
-os.environ.setdefault("MPLCONFIGDIR","/content/.mplconfig")
+)"
+if [ -z "${SITE_DIR}" ]; then
+  err "site-packages not found"; exit 1
+fi
+
+log "Writing sitecustomize.py for MPL backend & PyTorch Lightning shim"
+mkdir -p "${SITE_DIR}"
+cat > "${SITE_DIR}/sitecustomize.py" <<'PY'
+import os, sys, types
+# 1) Colab が注入する inline backend を無効化して Agg を強制
+if os.environ.get("MPLBACKEND","").startsWith("module://matplotlib_inline"):
+    os.environ["MPLBACKEND"] = "Agg"
 try:
     import matplotlib
     if str(matplotlib.get_backend()).startswith("module://"):
         matplotlib.use("Agg", force=True)
 except Exception:
     pass
+
+# 2) A1111 が参照しがちな古い import 互換:
+#    from pytorch_lightning.utilities.distributed import rank_zero_only
+try:
+    import importlib
+    try:
+        import pytorch_lightning.utilities.distributed  # noqa
+    except Exception:
+        rz = importlib.import_module("pytorch_lightning.utilities.rank_zero")
+        mod = types.ModuleType("pytorch_lightning.utilities.distributed")
+        mod.rank_zero_only = getattr(rz, "rank_zero_only", None)
+        sys.modules["pytorch_lightning.utilities.distributed"] = mod
+except Exception:
+    pass
 PY
-  chmod a+r "$SITEPKG/sitecustomize.py"
-else
-  warn "site-packages が見つからず、sitecustomize.py を配置できませんでした"
-fi
 
-# ----- /usr/local/bin/{python,pip} を venv に固定し、環境を無害化 -----
-log "Install wrappers: /usr/local/bin/python & pip -> venv and MPLBACKEND=Agg"
-$SUDO bash -lc "cat > /usr/local/bin/python <<'SH'
-#!/usr/bin/env bash
-# Clean env that confuses matplotlib/Colab
-unset PYTHONHOME
-unset PYTHONPATH
-unset MPLBACKEND
-export MPLBACKEND=Agg
-export MPLCONFIGDIR=/content/.mplconfig
-exec \"$VENV_DIR/bin/python\" \"\$@\"
-SH
-chmod +x /usr/local/bin/python"
+# 数値スタック（NumPy<2 系固定）先入れ
+log "Pre-pinning numeric stack (NumPy<2 etc.)"
+python -m pip install \
+  numpy==1.26.4 \
+  scipy==1.11.4 \
+  matplotlib==3.7.5 \
+  scikit-image==0.21.0 \
+  pillow==10.4.0
 
-$SUDO bash -lc "cat > /usr/local/bin/pip <<'SH'
-#!/usr/bin/env bash
-unset PYTHONHOME
-unset PYTHONPATH
-unset MPLBACKEND
-exec \"$VENV_DIR/bin/pip\" \"\$@\"
-SH
-chmod +x /usr/local/bin/pip"
+# PyTorch（A1111 既定と整合：cu121 系）
+log "Installing torch==2.1.2 / torchvision==0.16.2 (cu121)"
+python -m pip install \
+  torch==2.1.2 torchvision==0.16.2 \
+  --extra-index-url https://download.pytorch.org/whl/cu121
 
-# ----- 数値スタックの下地を「堅い組合せ」で先に入れる（NumPy2系との互換事故回避） -----
-log "Pre-pin numeric stack (numpy/scipy/mpl/scikit-image/pillow)"
-"$PIP_BIN_VENV" install \
-  'numpy==1.26.4' 'scipy==1.11.4' 'matplotlib==3.7.5' 'scikit-image==0.21.0' 'pillow==10.4.0'
+# A1111 周辺の相性ピン
+# - PL<2（ldm側の古い import に対応）
+# - tokenizers<0.14（transformers==4.30.x と整合）
+# - fastapi==0.90.1 / gradio==3.41.2 / protobuf==3.20.0 / pydantic==1 系
+log "Pinning common deps for webui compatibility"
+python -m pip install \
+  "pytorch_lightning==1.9.5" \
+  "tokenizers==0.13.3" \
+  "fastapi==0.90.1" \
+  "gradio==3.41.2" \
+  "starlette==0.25.0" \
+  "protobuf==3.20.0" \
+  "pydantic==1.10.13"
 
-# ----- Torch 2.1.2 (cu121) と torchvision を先に入れて WebUI の想定に合わせる -----
-log "Installing PyTorch ${TORCH_VER} + torchvision ${TV_VER} (cu121 wheels)"
-"$PIP_BIN_VENV" install --extra-index-url "$TORCH_IDX" \
-  "torch==${TORCH_VER}" "torchvision==${TV_VER}"
-
-# xformers はあると高速化。失敗しても続行。
-log "Installing xformers (optional, best-effort)"
-if ! "$PIP_BIN_VENV" install xformers==0.0.23.post1 >/dev/null 2>&1; then
-  warn "xformers prebuilt wheel not available; skipping (WebUI は無しでも起動します)"
-fi
-
-# ----- GitHub の WebUI requirements に合わせて足りない物を軽く整える -----
-# ユーザー提示の requirements に合わせ、未指定版は最新安定帯で導入。
-log "Installing minimal deps that A1111 requires (besides torch)"
-"$PIP_BIN_VENV" install \
-  GitPython Pillow accelerate blendmodes clean-fid diskcache einops facexlib \
-  "fastapi>=0.90.1" "gradio==3.41.2" inflection jsonmerge kornia lark numpy \
-  omegaconf open-clip-torch piexif "protobuf==3.20.0" psutil pytorch_lightning \
-  requests resize-right safetensors "scikit-image>=0.19" tomesd torchdiffeq torchsde \
-  "transformers==4.30.2" "pillow-avif-plugin==1.4.3" \
-  --upgrade --upgrade-strategy eager
-
-# ----- 動作チェック -----
-log "Sanity check (python & pip & mpl backend)"
+# xformers は未インストール推奨（CUDA/PyTorch ビルド不一致の警告回避）
 python - <<'PY'
-import sys, os, importlib
-print("Python:", sys.version)
-import torch, torchvision
-print("Torch:", torch.__version__, "| CUDA available:", torch.cuda.is_available())
-print("TorchVision:", torchvision.__version__)
-print("MPLBACKEND env:", os.environ.get("MPLBACKEND"))
-mpl = importlib.import_module("matplotlib")
-print("Matplotlib backend:", mpl.get_backend())
+import subprocess, sys
+subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "xformers"])
 PY
 
-log "All set. Use this to launch A1111:"
-echo '  %cd stable-diffusion-webui'
-echo '  !COMMANDLINE_ARGS="--share --gradio-debug --enable-insecure-extension-access --disable-safe-unpickle" python launch.py'
+# WebUI ディレクトリ確認
+if [ ! -d "$WEBUI_DIR" ]; then
+  err "Not found: ${WEBUI_DIR}   (git clone済みか確認してください)"
+  exit 1
+fi
+
+# 実行ヘルパ（venv の Python を必ず使用）
+RUN_WEBUI() {
+  log "Launching AUTOMATIC1111 webui with venv python"
+  cd "$WEBUI_DIR"
+  export PYTHONNOUSERSITE=1
+  export MPLBACKEND=Agg
+  export XFORMERS_DISABLED=1
+  exec "$VENV_DIR/bin/python" launch.py ${RUN_ARGS}
+}
+
+if [[ "${1:-}" == "--run-webui" ]]; then
+  RUN_WEBUI
+else
+  log "Setup completed. To run webui:"
+  echo "  !bash /content/Aimaster_pydantic_v1/setup_py310_venv.sh --run-webui"
+fi
