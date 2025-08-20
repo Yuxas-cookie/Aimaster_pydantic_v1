@@ -1,92 +1,112 @@
 #!/usr/bin/env bash
-set -eEuo pipefail
-export DEBIAN_FRONTEND=noninteractive
+# setup_py310_colab.sh
+# Colab向け: Python3.10の専用venvを作ってA1111 WebUIを確実に起動する
+# 使い方:
+#   bash /content/Aimaster_pydantic_v1/setup_py310_colab.sh            # 環境構築のみ
+#   bash /content/Aimaster_pydantic_v1/setup_py310_colab.sh --run-webui # 環境構築+A1111起動
 
-# ===== visible, robust logging =====
+set -euo pipefail
+
+# --------------------------
+# Helpers
+# --------------------------
 log(){ echo -e "\n\033[1;32m[INFO]\033[0m $*"; }
-err(){ echo -e "\n\033[1;31m[ERROR]\033[0m $*" >&2; }
-trap 'code=$?; err "Failed at line $LINENO (exit $code)"; exit $code' ERR
+warn(){ echo -e "\n\033[1;33m[WARN]\033[0m $*"; }
+err(){ echo -e "\n\033[1;31m[ERROR]\033[0m $*" 1>&2; }
 
-# ===== config =====
+# --------------------------
+# Paths & constants
+# --------------------------
 VENV_DIR="/content/py310"
+VENV_PY="${VENV_DIR}/bin/python"
+VENV_PIP="${VENV_DIR}/bin/pip"
+
+# ユーザのAimaster要件
+AIM_REPO_DIR="/content/Aimaster_pydantic_v1"
+AIM_REQ="${AIM_REPO_DIR}/requirements.txt"
+
+# A1111 WebUI
 WEBUI_DIR="/content/stable-diffusion-webui"
-RUN_ARGS="--share --gradio-debug --enable-insecure-extension-access --disable-safe-unpickle"
-REQ_AIMASTER="/content/Aimaster_pydantic_v1/requirements.txt"
-CONSTRAINTS="/tmp/constraints_a1111.txt"
-PYTHON_BIN="python3.10"
-SUDO=""
-command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+
+# A1111に最も安定な組み合わせ（CUDA 12.1想定 / Colabのドライバに合う）
+TORCH_VER="2.1.2"
+TV_VER="0.16.2"
+TORCH_EXTRA="--extra-index-url https://download.pytorch.org/whl/cu121"
+
+# WebUI requirementsの要点（リポに合わせた整合ピン）
+TRANSFORMERS_VER="4.30.2"
+PL_VER="1.9.5"            # pytorch_lightning(2.x)だと import path 変更でWebUIが落ちる
+TOKENIZERS_VER="0.13.3"
+GRADIO_VER="3.41.2"
+PROTOBUF_VER="3.20.0"
+PYDANTIC_VER="1.10.13"
+
+# FastAPI/Starletteは衝突を避けるため、互換の明示ピンを入れる
+# - fastapi 0.103.2 は pydantic <2 かつ starlette <0.28 を要求
+# - starlette 0.27.0 はその条件に合致、gradio 3.41.2 とも共存実績あり
+FASTAPI_VER="0.103.2"
+STARLETTE_VER="0.27.0"
+
+# 依存の上書きを防ぐための constraints を作る（pip -c）
+CONSTRAINTS_TXT="/content/.a1111_constraints.txt"
+
+# Matplotlib backend: Agg を強制（torchmetrics -> matplotlib経由のinline backend問題を潰す）
+MATPLOTRC="${HOME}/.config/matplotlib/matplotlibrc"
+
+# オプション
+RUN_WEBUI="0"
+if [[ "${1-}" == "--run-webui" ]]; then
+  RUN_WEBUI="1"
+fi
 
 log "Start setup_py310_colab.sh"
 uname -a || true
-$PYTHON_BIN -V || true
 
-# ----- helpers -----
-have_py310(){ command -v $PYTHON_BIN >/dev/null 2>&1; }
-have_ensurepip(){
-  $PYTHON_BIN - <<'PY' >/dev/null 2>&1
-import importlib.util, sys
-ok = importlib.util.find_spec("venv") and importlib.util.find_spec("ensurepip")
-sys.exit(0 if ok else 1)
-PY
-}
+# --------------------------
+# APT: Python3.10 + venv を必ず入れる
+# --------------------------
+log "Ensuring python3.10 and python3.10-venv are available"
+sudo apt-get update -y
+sudo apt-get install -y python3.10 python3.10-venv python3.10-distutils >/dev/null
 
-install_py310_stack(){
-  log "Installing Python 3.10 stack via APT"
-  $SUDO apt-get update -y
-  $SUDO apt-get install -y python3.10 python3.10-dev python3.10-distutils || true
-  $SUDO apt-get install -y python3.10-venv python3-pip
-}
-
-# ----- 1) Python 3.10 と ensurepip の確保 -----
-if ! have_py310; then
-  log "python3.10 not found -> installing"
-  install_py310_stack
-else
-  log "python3.10 found"
-  if ! have_ensurepip; then
-    log "ensurepip/venv is missing -> installing python3.10-venv"
-    $SUDO apt-get update -y
-    $SUDO apt-get install -y python3.10-venv
-  fi
+# --------------------------
+# Venv 作成 & pip 強化
+# --------------------------
+if [[ ! -x "${VENV_PY}" ]]; then
+  log "Creating venv at ${VENV_DIR}"
+  python3.10 -m venv "${VENV_DIR}"
 fi
 
-# 念のため
-$PYTHON_BIN -m ensurepip --upgrade || true
+log "Upgrading pip/setuptools/wheel in venv"
+"${VENV_PY}" -m ensurepip --upgrade || true
+"${VENV_PY}" -m pip install -U pip setuptools wheel
 
-# ----- 2) venv 作成 -----
-if [ ! -d "$VENV_DIR" ]; then
-  log "Creating venv at $VENV_DIR"
-  if ! $PYTHON_BIN -m venv "$VENV_DIR"; then
-    log "Retry venv after (re)installing python3.10-venv"
-    $SUDO apt-get install -y python3.10-venv
-    $PYTHON_BIN -m venv "$VENV_DIR"
-  fi
-else
-  log "venv already exists at $VENV_DIR"
-fi
+# Colab固有の inline backend をAggに差し替える仕込み
+log "Forcing matplotlib non-interactive backend (Agg)"
+mkdir -p "$(dirname "${MATPLOTRC}")"
+echo "backend: Agg" > "${MATPLOTRC}"
 
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
-export PYTHONUNBUFFERED=1
-log "Python in venv: $(python -V)"
-
-# pip/toolchain
-log "Upgrading pip / setuptools / wheel in venv"
-python -m pip install --upgrade pip setuptools wheel
-
-# ----- 3) Colab特有の backend 問題 & PL 旧import を sitecustomize で吸収 -----
-SITE_DIR="$(python - <<'PY'
-import site; p=site.getsitepackages(); print(p[0] if p else '')
+# sitecustomizeで環境変数のMPLBACKENDが inline でも強制的にAggへ
+SITE_PKGS="$("${VENV_PY}" - <<'PY'
+import site, sys, json
+paths=[]
+for getter in (getattr(site,"getsitepackages",lambda:[]), getattr(site,"getusersitepackages",lambda:"")):
+  try:
+    v=getter()
+    if isinstance(v,str): paths.append(v)
+    else: paths.extend(v)
+  except Exception: pass
+paths=[p for p in paths if p and "site-packages" in p]
+print(paths[0] if paths else "")
 PY
 )"
-[ -z "$SITE_DIR" ] && SITE_DIR="$VENV_DIR/lib/python3.10/site-packages"
-
-log "Writing sitecustomize.py to: $SITE_DIR"
-cat > "${SITE_DIR}/sitecustomize.py" <<'PY'
-import os, sys, types
-# 1) Force non-interactive backend for matplotlib in Colab
-if os.environ.get("MPLBACKEND","").startswith("module://matplotlib_inline"):
+if [[ -n "${SITE_PKGS}" ]]; then
+  cat > "${SITE_PKGS}/sitecustomize.py" <<'PY'
+import os
+# Jupyter/Colab が注入する inline backend をAggに矯正
+inline = "module://matplotlib_inline"
+val = os.environ.get("MPLBACKEND","")
+if val.startswith(inline):
     os.environ["MPLBACKEND"] = "Agg"
 try:
     import matplotlib
@@ -94,92 +114,121 @@ try:
         matplotlib.use("Agg", force=True)
 except Exception:
     pass
-
-# 2) Provide legacy import path for AUTOMATIC1111 (PL <-> rank_zero shim)
-try:
-    import importlib
-    try:
-        import pytorch_lightning.utilities.distributed  # noqa: F401
-    except Exception:
-        rz = importlib.import_module("pytorch_lightning.utilities.rank_zero")
-        mod = types.ModuleType("pytorch_lightning.utilities.distributed")
-        mod.rank_zero_only = getattr(rz, "rank_zero_only", None)
-        sys.modules["pytorch_lightning.utilities.distributed"] = mod
-except Exception:
-    pass
 PY
+fi
 
-mkdir -p ~/.config/matplotlib
-echo "backend: Agg" > ~/.config/matplotlib/matplotlibrc
-
-# ----- 4) A1111 に合わせて先に土台を固定（Torch 2.1.2/cu121 等）-----
-log "Pre-pinning numeric/core stack"
-python -m pip install \
-  "numpy==1.26.4" \
-  "scipy==1.11.4" \
-  "matplotlib==3.7.5" \
-  "scikit-image==0.21.0" \
-  "pillow==10.4.0"
-
-log "Installing torch==2.1.2 / torchvision==0.16.2 (cu121)"
-python -m pip install torch==2.1.2 torchvision==0.16.2 \
-  --extra-index-url https://download.pytorch.org/whl/cu121
-
-log "Pinning webui-aligned libs"
-python -m pip install \
-  "transformers==4.30.2" \
-  "pytorch_lightning==1.9.5" \
-  "protobuf==3.20.0" \
-  "gradio==3.41.2" \
-  "fastapi==0.90.1" \
-  "pydantic==1.10.13" \
-  "tokenizers==0.13.3" \
-  "starlette==0.25.0"
-
-# xformers は無効化（不一致警告を避ける）
-python -m pip uninstall -y xformers || true
+# --------------------------
+# xformers は CUDA/torch と合わないことが多いので無効化
+# --------------------------
+log "Disabling xformers to avoid CUDA/ABI mismatches"
+"${VENV_PIP}" uninstall -y xformers >/dev/null 2>&1 || true
 export XFORMERS_DISABLED=1
 
-# ----- 5) Aimaster の requirements を制約付きで導入（上書きを防止）-----
-if [ -f "$REQ_AIMASTER" ]; then
-  log "Writing constraints file: $CONSTRAINTS"
-  cat > "$CONSTRAINTS" <<'TXT'
-torch==2.1.2
-torchvision==0.16.2
-numpy==1.26.4
-scipy==1.11.4
-matplotlib==3.7.5
-pytorch_lightning==1.9.5
-transformers==4.30.2
-protobuf==3.20.0
-gradio==3.41.2
-fastapi==0.90.1
-pydantic==1.10.13
-tokenizers==0.13.3
-starlette==0.25.0
-TXT
+# --------------------------
+# 互換ピンの constraints を用意
+# --------------------------
+log "Writing constraints file to ${CONSTRAINTS_TXT}"
+cat > "${CONSTRAINTS_TXT}" <<EOF
+# --- Hard pins to avoid solver drift with WebUI (A1111) ---
+torch==${TORCH_VER}
+torchvision==${TV_VER}
+transformers==${TRANSFORMERS_VER}
+pytorch_lightning==${PL_VER}
+tokenizers==${TOKENIZERS_VER}
+gradio==${GRADIO_VER}
+protobuf==${PROTOBUF_VER}
+pydantic==${PYDANTIC_VER}
+fastapi==${FASTAPI_VER}
+starlette==${STARLETTE_VER}
+EOF
 
-  log "Installing /content/Aimaster_pydantic_v1/requirements.txt with constraints"
-  PIP_PREFER_BINARY=1 python -m pip install -r "$REQ_AIMASTER" -c "$CONSTRAINTS"
+# --------------------------
+# Torch (cu121) を先入れ（A1111の自動インストールをスキップさせる）
+# --------------------------
+log "Installing torch==${TORCH_VER} / torchvision==${TV_VER} (cu121)"
+"${VENV_PIP}" install "torch==${TORCH_VER}" "torchvision==${TV_VER}" ${TORCH_EXTRA}
+
+# --------------------------
+# WebUI整合ピンの主要ライブラリを先に入れる
+# （fastapi/starletteは互換ピン。fastapi 0.90.x とは starlette<0.24 依存で衝突するのでここで解消）
+# --------------------------
+log "Installing webui-aligned libs"
+"${VENV_PIP}" install \
+  "transformers==${TRANSFORMERS_VER}" \
+  "pytorch_lightning==${PL_VER}" \
+  "protobuf==${PROTOBUF_VER}" \
+  "gradio==${GRADIO_VER}" \
+  "pydantic==${PYDANTIC_VER}" \
+  "tokenizers==${TOKENIZERS_VER}" \
+  "fastapi==${FASTAPI_VER}" \
+  "starlette==${STARLETTE_VER}"
+
+# --------------------------
+# Aimaster の requirements を constraints 付きで導入
+#   - こちらが上で決めたピンを壊さないように -c を使う
+# --------------------------
+if [[ -f "${AIM_REQ}" ]]; then
+  log "Installing ${AIM_REQ} with constraints (no version drift)"
+  "${VENV_PIP}" install -r "${AIM_REQ}" -c "${CONSTRAINTS_TXT}"
 else
-  log "Skip Aimaster requirements (not found): $REQ_AIMASTER"
+  warn "Not found: ${AIM_REQ}  （スキップします）"
 fi
 
-# ----- 6) WebUI 起動関数（venvのpythonで実行）-----
-RUN_WEBUI(){
-  [ -d "$WEBUI_DIR" ] || { err "Not found: ${WEBUI_DIR} (git clone 済みか確認)"; exit 1; }
-  log "Launching AUTOMATIC1111 webui with venv python"
-  cd "$WEBUI_DIR"
-  export PYTHONNOUSERSITE=1
-  export MPLBACKEND=Agg
+# --------------------------
+# 便利エイリアス（任意）：このシェル内だけ有効
+# --------------------------
+export PYTHONNOUSERSITE=1
+export MPLBACKEND=Agg
+export HF_HUB_DISABLE_TELEMETRY=1
+export GRADIO_ANALYTICS_ENABLED="false"
+export PIP_NO_INPUT=1
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# --------------------------
+# ログ: 主要パッケージバージョン
+# --------------------------
+log "Python in venv: $("${VENV_PY}" -V)"
+log "torch:        $("${VENV_PY}" -c 'import torch,sys;print(torch.__version__, torch.version.cuda, sys.version.split()[0])' || true)"
+log "PL/transformers/gradio/fastapi/starlette:"
+"${VENV_PY}" - <<'PY' || true
+import importlib, pkgutil
+mods = ["pytorch_lightning","transformers","gradio","fastapi","starlette","pydantic","tokenizers","protobuf"]
+for m in mods:
+    try:
+        mod = importlib.import_module(m)
+        v = getattr(mod,"__version__",None) or getattr(mod,"version",None)
+        print(f"{m:20s} {v}")
+    except Exception as e:
+        print(f"{m:20s} (import error: {e})")
+PY
+
+# --------------------------
+# WebUI 起動（任意）
+# --------------------------
+if [[ "${RUN_WEBUI}" == "1" ]]; then
+  if [[ ! -d "${WEBUI_DIR}" ]]; then
+    err "WebUI directory not found: ${WEBUI_DIR}"
+    err "先に clone 済みであることを確認してください。例:"
+    err "  git clone https://github.com/AUTOMATIC1111/stable-diffusion-webui ${WEBUI_DIR}"
+    exit 1
+  fi
+
+  log "Launching A1111 WebUI"
+  cd "${WEBUI_DIR}"
+
+  # A1111側に「自前のPython/torchはもう入ってるよ」と教える
+  export PYTHON="${VENV_PY}"
+  export TORCH_COMMAND="echo 'torch preinstalled'"
+  export REQS_FILE="requirements.txt"
+  export COMMANDLINE_ARGS="--share --gradio-debug --enable-insecure-extension-access --disable-safe-unpickle"
+
+  # xformersは無効（前述）
   export XFORMERS_DISABLED=1
-  exec "$VENV_DIR/bin/python" launch.py ${RUN_ARGS}
-}
+  export MPLBACKEND=Agg
+  export PYTHONNOUSERSITE=1
 
-# ----- 7) 引数で制御 -----
-if [[ "${1:-}" == "--run-webui" ]]; then
-  RUN_WEBUI
-else
-  log "Setup completed. To run webui:"
-  echo "!stdbuf -oL -eL bash -x /content/Aimaster_pydantic_v1/setup_py310_colab.sh --run-webui 2>&1 | tee /content/py310_setup.log"
+  # 直接 launch.py を venvのpythonで呼ぶ
+  "${VENV_PY}" launch.py
 fi
+
+log "Done."
