@@ -8,5 +8,7 @@ opencv-python
 spandrel
 ultralytics==8.3.29
 psd_tools
-wandb==0.15.12
+watchdog>=5.0.0
+wandb==0.17.9
 # End of Selection
+
