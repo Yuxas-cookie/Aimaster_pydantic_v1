@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -eEuo pipefail
+export DEBIAN_FRONTEND=noninteractive
 
 # ===== visible, robust logging =====
 log(){ echo -e "\n\033[1;32m[INFO]\033[0m $*"; }
@@ -23,10 +24,10 @@ $PYTHON_BIN -V || true
 # ----- helpers -----
 have_py310(){ command -v $PYTHON_BIN >/dev/null 2>&1; }
 have_ensurepip(){
-  $PYTHON_BIN - <<'PY' >/dev/null 2>&1 || exit 1
-import importlib.util
+  $PYTHON_BIN - <<'PY' >/dev/null 2>&1
+import importlib.util, sys
 ok = importlib.util.find_spec("venv") and importlib.util.find_spec("ensurepip")
-raise SystemExit(0 if ok else 1)
+sys.exit(0 if ok else 1)
 PY
 }
 
@@ -79,7 +80,7 @@ SITE_DIR="$(python - <<'PY'
 import site; p=site.getsitepackages(); print(p[0] if p else '')
 PY
 )"
-[ -z "$SITE_DIR" ] && { err "site-packages not found"; exit 1; }
+[ -z "$SITE_DIR" ] && SITE_DIR="$VENV_DIR/lib/python3.10/site-packages"
 
 log "Writing sitecustomize.py to: $SITE_DIR"
 cat > "${SITE_DIR}/sitecustomize.py" <<'PY'
@@ -172,7 +173,6 @@ RUN_WEBUI(){
   export PYTHONNOUSERSITE=1
   export MPLBACKEND=Agg
   export XFORMERS_DISABLED=1
-  # exec で置き換え → 以降のログは Python 側から出ます
   exec "$VENV_DIR/bin/python" launch.py ${RUN_ARGS}
 }
 
