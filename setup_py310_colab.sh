@@ -45,3 +45,7 @@ log "Installing requirements for Aimaster_pydantic_v1 with Python 3.10..."
 python -m pip install -r "$REQ_FILE" --break-system-packages || python -m pip install -r "$REQ_FILE"
 
 log "Done. Current python is: $(python -V 2>&1)"
+
+log "Forcing matplotlib non-interactive backend"
+mkdir -p ~/.config/matplotlib
+echo "backend: Agg" > ~/.config/matplotlib/matplotlibrc
